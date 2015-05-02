@@ -15,6 +15,7 @@ Options:
     -t <seconds>, --interval <seconds>  report interval when running in follow mode [default: 2.0]
 
     -g <var>, --group-by <var>  group by variable [default: request_path]
+    -u <var>, --uni-count <var>  count unique values by [default: remote_addr]
     -w <var>, --having <expr>  having clause [default: 1]
     -o <var>, --order-by <var>  order of output for default query [default: count]
     -n <number>, --limit <number>  limit the number of records included in report for top command [default: 10]
@@ -65,6 +66,7 @@ import sqlite3
 import time
 import sys
 import signal
+import binascii
 
 try:
     import urlparse
@@ -74,8 +76,8 @@ except ImportError:
 from docopt import docopt
 import tabulate
 
-from .config_parser import detect_log_config, detect_config_path, extract_variables, build_pattern
-from .utils import error_exit
+from config_parser import detect_log_config, detect_config_path, extract_variables, build_pattern
+from utils import error_exit
 
 
 DEFAULT_QUERIES = [
@@ -95,6 +97,7 @@ DEFAULT_QUERIES = [
      '''SELECT
        %(--group-by)s,
        count(1)                                    AS count,
+       count(DISTINCT %(--uni-count)s)             AS uni_%(--uni-count)s,
        avg(bytes_sent)                             AS avg_bytes_sent,
        count(CASE WHEN status_type = 2 THEN 1 END) AS '2xx',
        count(CASE WHEN status_type = 3 THEN 1 END) AS '3xx',
@@ -107,7 +110,7 @@ DEFAULT_QUERIES = [
      LIMIT %(--limit)s''')
 ]
 
-DEFAULT_FIELDS = set(['status_type', 'bytes_sent'])
+DEFAULT_FIELDS = set(['status_type', 'bytes_sent', 'request_path', 'remote_addr'])
 
 
 # ======================
@@ -191,6 +194,10 @@ def parse_log(lines, pattern):
     records = map_field('bytes_sent', to_int, records)
     records = map_field('request_time', to_float, records)
     records = add_field('request_path', parse_request_path, records)
+    records = add_field('session',
+                        lambda r: "%(http_user_agent)08X - %(remote_addr)s" % {'remote_addr': r['remote_addr'],
+                        'http_user_agent': binascii.crc32(r['http_user_agent']) & 0xFFFFFFFF},
+                        records)
     return records
 
 
