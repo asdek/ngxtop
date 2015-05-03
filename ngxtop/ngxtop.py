@@ -14,8 +14,9 @@ Options:
                      Use this flag to tell ngxtop to process the current content of the access log instead.
     -t <seconds>, --interval <seconds>  report interval when running in follow mode [default: 2.0]
 
-    -g <var>, --group-by <var>  group by variable [default: request_path]
+    -g <var>, --group-by <var>  group by variable [default: request_path:TEXT]
     -u <var>, --uni-count <var>  count unique values by [default: remote_addr]
+    -r <seconds>, --auto-rotate <seconds>  time of existence records in the table [default: 0]
     -w <var>, --having <expr>  having clause [default: 1]
     -o <var>, --order-by <var>  order of output for default query [default: count]
     -n <number>, --limit <number>  limit the number of records included in report for top command [default: 10]
@@ -30,6 +31,7 @@ Options:
     -c <file>, --config <file>  allow ngxtop to parse nginx config file for log format and location.
     -i <filter-expression>, --filter <filter-expression>  filter in, records satisfied given expression are processed.
     -p <filter-expression>, --pre-filter <filter-expression> in-filter expression to check in pre-parsing phase.
+    -r <replace-expression>, --time-rpl-expr <replace-expression> pre-expression to replace in field time_local of log
 
 Examples:
     All examples read nginx config file for access log location and format.
@@ -45,7 +47,7 @@ Examples:
     $ ngxtop --order-by 'avg(bytes_sent) * count'
 
     Top 10 remote address, e.g., who's hitting you the most
-    $ ngxtop --group-by remote_addr
+    $ ngxtop --group-by remote_addr:TEXT
 
     Print requests with 4xx or 5xx status, together with status and http referer
     $ ngxtop -i 'status >= 400' print request status http_referer
@@ -66,7 +68,10 @@ import sqlite3
 import time
 import sys
 import signal
+import re
 import binascii
+import dateutil.parser as dt_parser
+from datetime import datetime as dt
 
 try:
     import urlparse
@@ -98,6 +103,7 @@ DEFAULT_QUERIES = [
        %(--group-by)s,
        count(1)                                    AS count,
        count(DISTINCT %(--uni-count)s)             AS uni_%(--uni-count)s,
+       max(datetime(time_local))                   AS last_timestamp,
        avg(bytes_sent)                             AS avg_bytes_sent,
        count(CASE WHEN status_type = 2 THEN 1 END) AS '2xx',
        count(CASE WHEN status_type = 3 THEN 1 END) AS '3xx',
@@ -110,7 +116,31 @@ DEFAULT_QUERIES = [
      LIMIT %(--limit)s''')
 ]
 
-DEFAULT_FIELDS = set(['status_type', 'bytes_sent', 'request_path', 'remote_addr'])
+DEFAULT_REPLACE_EXPRESSION = {
+    'in_rpl_expr': r'^(?P<d>[0-9]{2})/(?P<m>[0-9]{2})/(?P<Y>[0-9]{4}):'
+                   '(?P<time>[0-9]{2}:[0-9]{2}:[0-9]{2}) '
+                   '(?P<tzs>[+-])(?P<tzH>[0-9]{2})(?P<tzM>[0-9]{2})$',
+    'out_rpl_expr': r'\g<Y>-\g<m>-\g<d> \g<time>\g<tzs>\g<tzH>:\g<tzM>'
+}
+
+DEFAULT_REPLACE_MONTH = {'Jan': '01',
+                         'Feb': '02',
+                         'Mar': '03',
+                         'Apr': '04',
+                         'May': '05',
+                         'Jun': '06',
+                         'Jul': '07',
+                         'Aug': '08',
+                         'Sep': '09',
+                         'Oct': '10',
+                         'Nov': '11',
+                         'Dec': '12'}
+
+DEFAULT_FIELDS = dict({'status_type': 'INT', 'bytes_sent': 'INT', 'request_path': 'TEXT', 'time_local': 'DATETIME'})
+
+DEFAULT_LIMIT_TIME = 300
+
+DEFAULT_REGEXP_SPLITTER = r'(?P<key>.*):(?P<value>.*)'
 
 
 # ======================
@@ -141,6 +171,10 @@ def map_field(field, func, dict_sequence):
             yield item
         except ValueError:
             pass
+
+
+def fix_month(text):
+    return re.sub('([a-zA-Z]{3})', lambda m: DEFAULT_REPLACE_MONTH[m.group(1)], text)
 
 
 def add_field(field, func, dict_sequence):
@@ -185,7 +219,7 @@ def to_float(value):
     return float(value) if value and value != '-' else 0.0
 
 
-def parse_log(lines, pattern):
+def parse_log(lines, pattern, time_rpl_expr=dict({'in_rpl_expr': r'.*', 'out_rpl_expr': r'.*'})):
     matches = (pattern.match(l) for l in lines)
     records = (m.groupdict() for m in matches if m is not None)
     records = map_field('status', to_int, records)
@@ -194,9 +228,11 @@ def parse_log(lines, pattern):
     records = map_field('bytes_sent', to_int, records)
     records = map_field('request_time', to_float, records)
     records = add_field('request_path', parse_request_path, records)
-    records = add_field('session',
-                        lambda r: "%(http_user_agent)08X - %(remote_addr)s" % {'remote_addr': r['remote_addr'],
-                        'http_user_agent': binascii.crc32(r['http_user_agent']) & 0xFFFFFFFF},
+    records = map_field('time_local',
+                        lambda r: re.sub(time_rpl_expr['in_rpl_expr'], time_rpl_expr['out_rpl_expr'], fix_month(r)),
+                        records)
+    records = add_field('crc32_user_agent',
+                        lambda r: "0x%08X" % (binascii.crc32(r['http_user_agent']) & 0xFFFFFFFF),
                         records)
     return records
 
@@ -205,12 +241,14 @@ def parse_log(lines, pattern):
 # Records and statistic processor
 # =================================
 class SQLProcessor(object):
-    def __init__(self, report_queries, fields, index_fields=None):
+    def __init__(self, report_queries, fields, auto_rotate, index_fields=None):
         self.begin = False
         self.report_queries = report_queries
+        self.auto_rotate = auto_rotate
         self.index_fields = index_fields if index_fields is not None else []
-        self.column_list = ','.join(fields)
-        self.holder_list = ','.join(':%s' % var for var in fields)
+        self.column_list = ','.join(fields.keys())
+        self.column_list_ex = ','.join(['%s %s' % (key, value) for (key, value) in fields.items()])
+        self.holder_list = ','.join(':%s' % var for var in fields.keys())
         self.conn = sqlite3.connect(':memory:')
         self.init_db()
 
@@ -225,6 +263,13 @@ class SQLProcessor(object):
     def report(self):
         if not self.begin:
             return ''
+        if self.auto_rotate['enabled']:
+            with closing(self.conn.cursor()) as cursor:
+                cursor.execute(self.auto_rotate['get_last_ts_query'])
+                self.auto_rotate['last_timestamp'] = cursor.fetchone()[0]
+                if not self.auto_rotate['last_timestamp']:
+                    self.auto_rotate['last_timestamp'] = dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                self.rotate()
         count = self.count()
         duration = time.time() - self.begin
         status = 'running for %.0f seconds, %d records processed: %.2f req/sec'
@@ -242,7 +287,7 @@ class SQLProcessor(object):
         return '\n\n'.join(output)
 
     def init_db(self):
-        create_table = 'create table log (%s)' % self.column_list
+        create_table = 'create table log (%s)' % self.column_list_ex
         with closing(self.conn.cursor()) as cursor:
             logging.info('sqlite init: %s', create_table)
             cursor.execute(create_table)
@@ -256,16 +301,21 @@ class SQLProcessor(object):
             cursor.execute('select count(1) from log')
             return cursor.fetchone()[0]
 
+    def rotate(self):
+        with closing(self.conn.cursor()) as cursor:
+            cursor.execute(self.auto_rotate['delete_old_rows_query'], self.auto_rotate)
+
 
 # ===============
 # Log processing
 # ===============
 def process_log(lines, pattern, processor, arguments):
+    time_rpl_expr = arguments['--time-rpl-expr']
     pre_filer_exp = arguments['--pre-filter']
     if pre_filer_exp:
         lines = (line for line in lines if eval(pre_filer_exp, {}, dict(line=line)))
 
-    records = parse_log(lines, pattern)
+    records = parse_log(lines, pattern, time_rpl_expr)
 
     filter_exp = arguments['--filter']
     if filter_exp:
@@ -276,27 +326,41 @@ def process_log(lines, pattern, processor, arguments):
 
 
 def build_processor(arguments):
+    splitter = re.compile(DEFAULT_REGEXP_SPLITTER)
+
+    group_by_list = arguments['--group-by']
+    arguments['--list-group-by'] = list()
+    arguments['--list-group-by-type'] = list()
+    for arg in group_by_list.split(','):
+        group_by_element = splitter.match(arg).groupdict()
+        if group_by_element is None:
+            error_exit('incorrect item group-by of fields data "%s"' % arg)
+        arguments['--list-group-by'].append(group_by_element['key'])
+        arguments['--list-group-by-type'].append(group_by_element['value'])
+    arguments['--group-by'] = ','.join(arguments['--list-group-by'])
+    arguments['--group-by-type'] = ','.join(arguments['--list-group-by-type'])
+
     fields = arguments['<var>']
     if arguments['print']:
-        label = ', '.join(fields) + ':'
-        selections = ', '.join(fields)
+        label = ', '.join(fields.keys()) + ':'
+        selections = ', '.join(fields.keys())
         query = 'select %s from log group by %s' % (selections, selections)
         report_queries = [(label, query)]
     elif arguments['top']:
         limit = int(arguments['--limit'])
         report_queries = []
-        for var in fields:
+        for var in fields.keys():
             label = 'top %s' % var
             query = 'select %s, count(1) as count from log group by %s order by count desc limit %d' % (var, var, limit)
             report_queries.append((label, query))
     elif arguments['avg']:
-        label = 'average %s' % fields
-        selections = ', '.join('avg(%s)' % var for var in fields)
+        label = 'average %s' % fields.keys()
+        selections = ', '.join('avg(%s)' % var for var in fields.keys())
         query = 'select %s from log' % selections
         report_queries = [(label, query)]
     elif arguments['sum']:
-        label = 'sum %s' % fields
-        selections = ', '.join('sum(%s)' % var for var in fields)
+        label = 'sum %s' % fields.keys()
+        selections = ', '.join('sum(%s)' % var for var in fields.keys())
         query = 'select %s from log' % selections
         report_queries = [(label, query)]
     elif arguments['query']:
@@ -304,16 +368,41 @@ def build_processor(arguments):
         fields = arguments['<fields>']
     else:
         report_queries = [(name, query % arguments) for name, query in DEFAULT_QUERIES]
-        fields = DEFAULT_FIELDS.union(set([arguments['--group-by']]))
+        fields = dict(DEFAULT_FIELDS, **dict(zip(arguments['--list-group-by'], arguments['--list-group-by-type'])))
 
     for label, query in report_queries:
         logging.info('query for "%s":\n %s', label, query)
 
-    processor_fields = []
-    for field in fields:
-        processor_fields.extend(field.split(','))
+    auto_rotate = dict()
+    limit_time = int(arguments['--auto-rotate'])
+    auto_rotate['enabled'] = True if limit_time else False
+    auto_rotate['interval'] = DEFAULT_LIMIT_TIME if limit_time < 0 or limit_time > 2592000 else limit_time
+    auto_rotate['last_timestamp'] = ''
+    if auto_rotate['enabled']:
+        auto_rotate['get_last_ts_query'] = 'select max(time_local) from log'
+        auto_rotate['delete_old_rows_query'] = 'delete from log where datetime(time_local) < ' \
+                                               'datetime(:last_timestamp, "-" || :interval || " seconds")'
+        logging.info('query for select last timestamp: %s', auto_rotate['get_last_ts_query'])
+        logging.info('query for delete old rows: %s', auto_rotate['delete_old_rows_query'])
 
-    processor = SQLProcessor(report_queries, processor_fields)
+    if not arguments['--time-rpl-expr']:
+        arguments['--time-rpl-expr'] = DEFAULT_REPLACE_EXPRESSION
+
+    processor_fields = dict()
+    if type(fields) is str:
+        for field in fields:
+            items = field.split(',')
+            for item in items:
+                fields_element = splitter.match(item).groupdict()
+                if fields_element is None:
+                    error_exit('failed parsing of field data "%s"' % item)
+                processor_fields[fields_element['key']] = fields_element['value']
+    elif type(fields) is dict:
+        processor_fields = fields
+    else:
+        error_exit('incorrect type of fields data "%s"' % str(type(fields)))
+
+    processor = SQLProcessor(report_queries, processor_fields, auto_rotate)
     return processor
 
 
