@@ -15,7 +15,7 @@ Options:
     -t <seconds>, --interval <seconds>  report interval when running in follow mode [default: 2.0]
 
     -g <var>, --group-by <var>  group by variable [default: request_path:TEXT]
-    -u <var>, --uni-count <var>  count unique values by [default: remote_addr]
+    -u <var>, --uni-count <var>  count unique values by [default: remote_addr:NCHAR(16)]
     -r <seconds>, --auto-rotate <seconds>  time of existence records in the table [default: 0]
     -w <var>, --having <expr>  having clause [default: 1]
     -o <var>, --order-by <var>  order of output for default query [default: count]
@@ -70,7 +70,6 @@ import sys
 import signal
 import re
 import binascii
-import dateutil.parser as dt_parser
 from datetime import datetime as dt
 
 try:
@@ -95,7 +94,6 @@ DEFAULT_QUERIES = [
        count(CASE WHEN status_type = 4 THEN 1 END) AS '4xx',
        count(CASE WHEN status_type = 5 THEN 1 END) AS '5xx'
      FROM log
-     ORDER BY %(--order-by)s DESC
      LIMIT %(--limit)s'''),
 
     ('Detailed:',
@@ -243,8 +241,11 @@ def parse_log(lines, pattern, time_rpl_expr=dict({'in_rpl_expr': r'.*', 'out_rpl
 class SQLProcessor(object):
     def __init__(self, report_queries, fields, auto_rotate, index_fields=None):
         self.begin = False
+        self.start_time_iteration = time.time()
         self.report_queries = report_queries
         self.auto_rotate = auto_rotate
+        self.num_of_del_rows = 0
+        self.num_of_insert_rows = 0
         self.index_fields = index_fields if index_fields is not None else []
         self.column_list = ','.join(fields.keys())
         self.column_list_ex = ','.join(['%s %s' % (key, value) for (key, value) in fields.items()])
@@ -259,6 +260,7 @@ class SQLProcessor(object):
         with closing(self.conn.cursor()) as cursor:
             for r in records:
                 cursor.execute(insert, r)
+                self.num_of_insert_rows += 1
 
     def report(self):
         if not self.begin:
@@ -269,11 +271,15 @@ class SQLProcessor(object):
                 self.auto_rotate['last_timestamp'] = cursor.fetchone()[0]
                 if not self.auto_rotate['last_timestamp']:
                     self.auto_rotate['last_timestamp'] = dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                self.rotate()
+                self.num_of_del_rows += self.rotate()
         count = self.count()
-        duration = time.time() - self.begin
-        status = 'running for %.0f seconds, %d records processed: %.2f req/sec'
-        output = [status % (duration, count, count / duration)]
+        now = time.time()
+        duration = now - self.begin
+        duration_iteration = now - self.start_time_iteration
+        status = 'running for %.0f seconds, %d records processed, %d records deleted: %.2f req/sec'
+        output = [status % (duration, count, self.num_of_del_rows, self.num_of_insert_rows / duration_iteration)]
+        self.start_time_iteration = now
+        self.num_of_insert_rows = 0
         with closing(self.conn.cursor()) as cursor:
             for query in self.report_queries:
                 if isinstance(query, tuple):
@@ -304,6 +310,7 @@ class SQLProcessor(object):
     def rotate(self):
         with closing(self.conn.cursor()) as cursor:
             cursor.execute(self.auto_rotate['delete_old_rows_query'], self.auto_rotate)
+            return cursor.rowcount
 
 
 # ===============
@@ -340,6 +347,12 @@ def build_processor(arguments):
     arguments['--group-by'] = ','.join(arguments['--list-group-by'])
     arguments['--group-by-type'] = ','.join(arguments['--list-group-by-type'])
 
+    uni_count_element = splitter.match(arguments['--uni-count']).groupdict()
+    if uni_count_element is None:
+        error_exit('incorrect item uni-count of fields data "%s"' % arguments['--uni-count'])
+    arguments['--uni-count'] = uni_count_element['key']
+    arguments['--uni-count-type'] = uni_count_element['value']
+
     fields = arguments['<var>']
     if arguments['print']:
         label = ', '.join(fields.keys()) + ':'
@@ -369,6 +382,7 @@ def build_processor(arguments):
     else:
         report_queries = [(name, query % arguments) for name, query in DEFAULT_QUERIES]
         fields = dict(DEFAULT_FIELDS, **dict(zip(arguments['--list-group-by'], arguments['--list-group-by-type'])))
+        fields[arguments['--uni-count']] = arguments['--uni-count-type']
 
     for label, query in report_queries:
         logging.info('query for "%s":\n %s', label, query)
