@@ -276,8 +276,9 @@ class SQLProcessor(object):
         now = time.time()
         duration = now - self.begin
         duration_iteration = now - self.start_time_iteration
-        status = 'running for %.0f seconds, %d records processed, %d records deleted: %.2f req/sec'
-        output = [status % (duration, count, self.num_of_del_rows, self.num_of_insert_rows / duration_iteration)]
+        status = 'running for %.0f seconds, %d records processed, %d records deleted: (cur: %.2f; all: %.2f) req/sec'
+        output = [status % (duration, count, self.num_of_del_rows, self.num_of_insert_rows / duration_iteration,
+                            (count + self.num_of_del_rows) / duration)]
         self.start_time_iteration = now
         self.num_of_insert_rows = 0
         with closing(self.conn.cursor()) as cursor:
