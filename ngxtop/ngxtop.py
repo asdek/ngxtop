@@ -101,6 +101,7 @@ DEFAULT_QUERIES = [
        %(--group-by)s,
        count(1)                                    AS count,
        count(DISTINCT %(--uni-count)s)             AS uni_%(--uni-count)s,
+       CAST(count(DISTINCT %(--uni-count)s) AS FLOAT) / count(1)  AS percent_uni,
        max(datetime(time_local))                   AS last_timestamp,
        avg(bytes_sent)                             AS avg_bytes_sent,
        count(CASE WHEN status_type = 2 THEN 1 END) AS '2xx',
