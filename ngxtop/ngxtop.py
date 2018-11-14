@@ -16,9 +16,10 @@ Options:
 
     -g <var>, --group-by <var>  group by variable [default: request_path:TEXT]
     -u <var>, --uni-count <var>  count unique values by [default: remote_addr:NCHAR(16)]
-    -r <seconds>, --auto-rotate <seconds>  time of existence records in the table [default: 0]
+    -z <seconds>, --auto-rotate <seconds>  time of existence records in the table [default: 0]
     -w <var>, --having <expr>  having clause [default: 1]
     -o <var>, --order-by <var>  order of output for default query [default: count]
+    -m <var>, --order-mode <var>  reverse order of output for query [default: DESC]
     -n <number>, --limit <number>  limit the number of records included in report for top command [default: 10]
     -a <exp> ..., --a <exp> ...  add exp (must be aggregation exp: sum, avg, min, max, etc.) into output
 
@@ -103,6 +104,7 @@ DEFAULT_QUERIES = [
        count(DISTINCT %(--uni-count)s)             AS uni_%(--uni-count)s,
        max(datetime(time_local))                   AS last_timestamp,
        avg(bytes_sent)                             AS avg_bytes_sent,
+       avg(request_time)                           AS avg_req_time,
        count(CASE WHEN status_type = 2 THEN 1 END) AS '2xx',
        count(CASE WHEN status_type = 3 THEN 1 END) AS '3xx',
        count(CASE WHEN status_type = 4 THEN 1 END) AS '4xx',
@@ -110,7 +112,7 @@ DEFAULT_QUERIES = [
      FROM log
      GROUP BY %(--group-by)s
      HAVING %(--having)s
-     ORDER BY %(--order-by)s DESC
+     ORDER BY %(--order-by)s %(--order-mode)s
      LIMIT %(--limit)s''')
 ]
 
@@ -134,7 +136,11 @@ DEFAULT_REPLACE_MONTH = {'Jan': '01',
                          'Nov': '11',
                          'Dec': '12'}
 
-DEFAULT_FIELDS = dict({'status_type': 'INT', 'bytes_sent': 'INT', 'request_path': 'TEXT', 'time_local': 'DATETIME'})
+DEFAULT_FIELDS = dict({'status_type': 'INT',
+                       'bytes_sent': 'INT',
+                       'request_time': 'FLOAT',
+                       'request_path': 'TEXT',
+                       'time_local': 'DATETIME'})
 
 DEFAULT_LIMIT_TIME = 300
 
@@ -355,17 +361,29 @@ def build_processor(arguments):
     arguments['--uni-count-type'] = uni_count_element['value']
 
     fields = arguments['<var>']
+    if type(fields) == list:
+        t_fields = dict()
+        for field in fields:
+            t_fields[field] = ""
+        fields = t_fields
     if arguments['print']:
         label = ', '.join(fields.keys()) + ':'
         selections = ', '.join(fields.keys())
-        query = 'select %s from log group by %s' % (selections, selections)
+        order_by = str(arguments['--order-by'])
+        order_mode = str(arguments['--order-mode'])
+        order_str = ""
+        if not order_by == 'count':
+            order_str = "order by %s %s" % (order_by, order_mode)
+        query = 'select %s from log group by %s %s' % (selections, selections, order_str)
         report_queries = [(label, query)]
     elif arguments['top']:
         limit = int(arguments['--limit'])
+        mode = str(arguments['--order-mode'])
         report_queries = []
         for var in fields.keys():
             label = 'top %s' % var
-            query = 'select %s, count(1) as count from log group by %s order by count desc limit %d' % (var, var, limit)
+            query = 'select %s, count(1) as count from log group by %s order by count %s limit %d' % \
+                    (var, var, mode, limit)
             report_queries.append((label, query))
     elif arguments['avg']:
         label = 'average %s' % fields.keys()
